@@ -1,0 +1,37 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Kindle Desk 本地预览（热重载）",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/dev_preview.py",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "jinja": false
+        },
+        {
+            "name": "Kindle Desk 本地预览",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/dev_preview.py",
+            "args": [
+                "--demo"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false
+        },
+        {
+            "name": "官方预览：app.py --preview",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/kindle-standalone/app.py",
+            "args": [
+                "--preview"
+            ],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false
+        }
+    ]
+}

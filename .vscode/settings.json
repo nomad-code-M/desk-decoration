@@ -1,0 +1,13 @@
+{
+    "python.analysis.extraPaths": [
+        "kindle-standalone",
+        "kindle-standalone/vendor"
+    ],
+    "python.testing.unittestEnabled": true,
+    "python.testing.unittestArgs": [
+        "-s",
+        "tests",
+        "-v"
+    ],
+    "editor.rulers": []
+}
