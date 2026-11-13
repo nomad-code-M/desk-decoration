@@ -4,9 +4,9 @@ from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
 APP=ROOT/'kindle-standalone'
 VERSION='2.0.0'
-
+# names=['README.md' =names=['FKREADME.md' 修改了README命名
 def release_files():
-    names=['README.md','CHANGELOG.md','LICENSE','THIRD_PARTY_NOTICES.md','requirements.txt','install.py','.gitignore','.gitattributes']
+    names=['FKREADME.md','CHANGELOG.md','LICENSE','THIRD_PARTY_NOTICES.md','requirements.txt','install.py','.gitignore','.gitattributes']
     for path in APP.iterdir():
         if path.is_file() and path.suffix in ('.py','.pyw','.sh','.cmd'): names.append(path.relative_to(ROOT).as_posix())
     for folder in ('kindle-standalone/assets','kindle-standalone/vendor','extensions','docs','scripts','tests','.github'):
