@@ -1,1 +1,9 @@
-{"items":[{"name":"Kindle Desk — 桌面看板","priority":0,"action":"sh /mnt/us/kindle-standalone/IndependentDashboard.sh"}]}
+{
+    "items": [
+        {
+            "name": "打开桌面摆件",
+            "priority": 0,
+            "action": "sh /mnt/us/kindle-standalone/IndependentDashboard.sh"
+        }
+    ]
+}

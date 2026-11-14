@@ -46,7 +46,7 @@ def page(data,prefix,csrf,device=False,edit_id='',delete_id='',message='',new_da
         if e.get('note'): body+='<p>'+escape(e['note'])+'</p>'
         body+='<a class="button secondary" href="'+prefix+'/?'+args+'edit='+quote(e['id'])+'">修改</a><a class="button secondary" href="'+prefix+'/?'+args+'delete='+quote(e['id'])+'">删除</a></div>'
     body+='<h2>天气城市</h2>'+form('city')+'<label for="city">留空自动估算所在城市</label><input id="city" name="city" maxlength="80" value="'+escape(data.get('city',''),quote=True)+'"><button type="submit">保存城市</button></form><p class="muted">自动定位依据网络出口 IP，可能与实际位置有偏差。天气需要联网；已保存的日程不需要。</p>'
-    body+='<h2>AI 金融资讯</h2><p class="muted">每小时自动刷新，看板显示前 6 条，历史保留 48 小时，最多 300 条。</p><p><a class="button secondary" href="'+prefix+'/news'+suffix+'">打开资讯列表</a></p>'
+    body+='<h2>热榜资讯</h2><p class="muted">每小时自动刷新，看板显示前 6 条，历史保留 48 小时，最多 300 条。</p><p><a class="button secondary" href="'+prefix+'/news'+suffix+'">打开资讯列表</a></p>'
     return layout('Kindle 日程管理',body)
 
 def todo_page(data,prefix,csrf,device=False,edit_id='',delete_id='',message=''):
@@ -89,7 +89,7 @@ def news_page(items,news_at,prefix,error='',csrf='',device=False):
         try: stamp=datetime.fromisoformat(news_at).strftime('%m-%d %H:%M')
         except ValueError: pass
     suffix='?device=kindle' if device else ''
-    body='<h1>AI 金融资讯</h1><p class="muted">更新于 '+stamp+' · 最近 48 小时 · 每小时自动刷新 · 点条目看全文</p>'
+    body='<h1>热榜资讯</h1><p class="muted">更新于 '+stamp+' · 最近 48 小时 · 每小时自动刷新 · 点条目看全文</p>'
     body+=('<form method="post" action="'+prefix+'/action">'+hidden('csrf',csrf)+hidden('action','refresh_news')
            +hidden('device','kindle' if device else '')+'<button type="submit">立即刷新</button>'
            '<a class="button secondary" href="'+prefix+'/'+suffix+'">返回日程管理</a></form>')
@@ -100,7 +100,7 @@ def news_page(items,news_at,prefix,error='',csrf='',device=False):
         meta=str(i)+' · '+escape(item.get('source') or '')+((' · '+when) if when else '')
         body+='<div class="card"><div class="muted">'+meta+'</div><a class="title" href="'+escape(item.get('url') or '',quote=True)+'">'+escape(item.get('name') or '')+'</a></div>'
     body+='<p style="margin-top:20px"><a class="button secondary" href="'+prefix+'/'+suffix+'">返回日程管理</a></p>'
-    return layout('AI 金融资讯',body,'<meta http-equiv="refresh" content="300">')
+    return layout('热榜资讯',body,'<meta http-equiv="refresh" content="300">')
 
 def error_page(message,prefix):
     return layout('请检查', '<h1>暂未保存</h1><p class="notice">'+escape(message)+'</p><a class="button" href="'+prefix+'/">重新打开日程</a>')

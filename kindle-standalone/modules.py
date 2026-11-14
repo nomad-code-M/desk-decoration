@@ -8,9 +8,9 @@ from PIL import Image,ImageOps
 from store import atomic_json
 
 CATALOG=(
-    ('finance','AI 金融资讯','AI 与金融快讯，历史保留 48 小时。','news'),
-    ('news','综合新闻','关注最新快讯，不限 AI 主题。','news'),
-    ('weibo','微博热搜','微博实时榜单；无法获取时显示上次内容和时间。','trend'),
+    # 原来「AI 金融资讯 / 综合新闻 / 微博热搜」三项已合并成这一项。
+    # 内部代号仍叫 finance，配置里存的老值 news、weibo 会在 store 里自动迁过来。
+    ('finance','热点资讯','华尔街见闻、抖音、凤凰、GitHub、IT之家、钛媒体多源合并，最新优先。','news'),
     ('usage','AI 用量与余额','DeepSeek 余额与 Codex 用量，在同一块查看。','chart'),
     ('photo','我的图片','上传照片或信息卡，适配墨水屏。','image'),
 )

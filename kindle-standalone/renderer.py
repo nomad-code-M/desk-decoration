@@ -4,11 +4,21 @@ from functools import lru_cache
 from bisect import bisect_right
 import math, calendar, os
 from PIL import Image,ImageDraw,ImageFont
+from store import NEWS_LABELS
 ROOT=Path(__file__).resolve().parent
 FONT_ASSETS=Path(os.environ.get('KINDLE_PREFLIGHT_ASSETS',str(ROOT/'assets')))
 TZ=timezone(timedelta(hours=8))
 NEWS_LIMIT=300
 NEWS_MAX_AGE=48*3600
+# 各个源的开关名与显示名来自 store.py 的 NEWS_SOURCES（唯一配置源），这里不再重复维护
+# 开关名集合，app.py 判断「改了来源设置要不要立刻重抓」时用
+NEWS_KEYS=tuple(key for key,_ in NEWS_LABELS)
+# 来源开关页每行的点击区域：行高按源的数量自适应，以后加到 7、8 个源也不会挤出屏幕
+_SOURCE_TOP=112
+_SOURCE_ROW=min(86,(700-_SOURCE_TOP)//max(1,len(NEWS_LABELS)))
+SOURCE_ROWS=[(30,_SOURCE_TOP+i*_SOURCE_ROW,570,_SOURCE_TOP+(i+1)*_SOURCE_ROW-8) for i in range(len(NEWS_LABELS))]
+# 首页轮播秒数在设备上点一下的备选刻度（手机后台可填 5-300 任意整数）
+CAROUSEL_STEPS=(15,30,45,60,90,120)
 def now(): return datetime.now(TZ)
 
 # BEGIN OFFLINE CALENDAR TABLES
@@ -543,10 +553,8 @@ def news_items(value):
 
 def enabled_news(config,items):
     settings=config.get('settings') or {}
-    sources={
-        '华尔街见闻':settings.get('news_wallstreetcn',True),
-        '东方财富':settings.get('news_eastmoney',True),
-    }
+    # 每个源一个开关；source 不在表里的（比如以后新加的源还没登记）默认显示，不会被误藏
+    sources={label:settings.get(key,True) for key,label in NEWS_LABELS}
     return [item for item in items if sources.get(item.get('source'),True)]
 
 def merge_news_history(previous,incoming=(),current=None,fallback=None):
@@ -572,6 +580,9 @@ def merge_news_history(previous,incoming=(),current=None,fallback=None):
         item=dict(name=name,url=url,source=source,time=int(published or 0),seen_at=seen)
         content=str(raw.get('content') or old.get('content') or '')
         if content: item['content']=content[:12000]+('…（更多内容请用手机查看原文）' if len(content)>12000 else '')
+        # GitHub 榜单那类没有发布时间的内容，用换算好的具体日期（11/12、23年）当时间显示
+        label=str(raw.get('date_label') or old.get('date_label') or '')
+        if label: item['date_label']=label[:20]
         unique[key]=item
     return sorted(unique.values(),key=lambda v:v['time'] or v['seen_at'],reverse=True)[:NEWS_LIMIT]
 
@@ -587,16 +598,19 @@ def event_time(value,time_format='24'):
     except (TypeError,ValueError): return str(value)
 
 def fmt_news_time(value,current,time_format='24'):
-    try: moment=datetime.fromtimestamp(int(value),TZ)
-    except (TypeError,ValueError,OSError,OverflowError): return ''
+    try: stamp=int(value)
+    except (TypeError,ValueError): return ''
+    if stamp<=0: return ''   # 0 表示「没有发布时间」（比如 GitHub 榜单），不显示假时间
+    moment=datetime.fromtimestamp(stamp,TZ)
     if moment.date()==current.date(): return clock_text(moment,time_format)
     return moment.strftime('%m/%d')
 
 def fmt_news_full(value,time_format='24'):
-    try:
-        moment=datetime.fromtimestamp(int(value),TZ)
-        return moment.strftime('%m-%d')+' '+clock_text(moment,time_format)
-    except (TypeError,ValueError,OSError,OverflowError): return ''
+    try: stamp=int(value)
+    except (TypeError,ValueError): return ''
+    if stamp<=0: return ''
+    moment=datetime.fromtimestamp(stamp,TZ)
+    return moment.strftime('%m-%d')+' '+clock_text(moment,time_format)
 
 _MEASURE=ImageDraw.Draw(Image.new('L',(8,8)))
 
@@ -902,6 +916,14 @@ def render_agenda(config,page=0,day=None,time_format='24'):
     _draw_buttons(d,('返回','新增','日历'))
     return image
 
+def news_brief(item):
+    # 列表里那句「这条到底是干什么的」的说明：和标题重复就不显示，省一行给别的条目
+    content=' '.join(str(item.get('content') or '').split())
+    title=' '.join(str(item.get('name') or '').split())
+    if not content or content==title: return ''
+    if title and content.startswith(title[:10]): return ''
+    return content
+
 def render_news_history(items,page=0,refreshing=False,time_format='24',title='AI 金融资讯',history=True):
     selected,page,total=page_slice(items,page)
     subtitle='正在更新资讯…' if refreshing else ('最近 48 小时' if history else '当前榜单')+f' · 共 {len(items)} 条 · 点条目查看'
@@ -910,8 +932,14 @@ def render_news_history(items,page=0,refreshing=False,time_format='24',title='AI
     for i,item in enumerate(selected):
         y=125+i*85
         meta=fmt_news_full(item.get('time'),time_format) or '获取于 '+fmt_news_full(item.get('seen_at'),time_format)
-        d.text((30,y),fit_text(d,meta+' · '+item.get('source',''),16,540),font=font(16),fill=75,anchor='lt')
-        for j,line in enumerate(wrap_lines(' '.join(item['name'].split()),20,540)[:2]):
+        d.text((30,y),fit_text(d,(meta+' · ' if meta else '')+item.get('source',''),16,540),font=font(16),fill=75,anchor='lt')
+        title_lines=wrap_lines(' '.join(item['name'].split()),20,540)
+        brief=news_brief(item)
+        if brief:
+            # 有简介时标题只占一行，第二行放简介，这样一眼就能看出这条讲什么
+            title_lines=title_lines[:1]
+            d.text((30,y+48),fit_text(d,brief,16,540),font=font(16),fill=90,anchor='lt')
+        for j,line in enumerate(title_lines[:2]):
             d.text((30,y+25+j*24),line,font=font(20),fill=0,anchor='lt')
         d.line((30,y+80,570,y+80),fill=205,width=1)
     pager(d,page,total)
@@ -1031,7 +1059,7 @@ PHOTO_BOXES=[(30+(i%2)*280,125+(i//2)*255,290+(i%2)*280,365+(i//2)*255) for i in
 
 def settings_hitboxes(page):
     actions={
-        'content':['module_picker',('setting_cycle','module_interval'),('setting','news_wallstreetcn'),('setting','news_eastmoney'),('photos','panel'),'pair'],
+        'content':['module_picker',('setting_cycle','module_interval'),'source_picker','cycle_carousel',('photos','panel'),'pair'],
         'display':[('setting_cycle','time_format'),('setting_cycle','full_refresh'),('setting_cycle','sleep_display'),('photos','standby'),('setting_cycle','idle_minutes'),('setting','standby_wifi')],
         'network':['wifi','pair','city_editor',('setting_cycle','weather_interval')],
     }
@@ -1082,13 +1110,15 @@ def render_settings(config,state,wifi_status=None,power_available=True,page='con
         d.text((48,566),'切换 Wi-Fi 后请重新扫码连接手机。',font=font(18),fill=75,anchor='lt')
         hint='设备休眠时暂停联网，唤醒后恢复'
     else:
-        row(0,'中间模块',modules.TITLES.get(modules.selected(config),'AI 金融资讯'))
+        row(0,'中间模块',modules.TITLES.get(modules.selected(config),'热点资讯'))
         row(1,'模块刷新',f"{settings.get('module_interval',30)} 分钟")
-        row(2,'华尔街见闻','',bool(settings.get('news_wallstreetcn',True)))
-        row(3,'东方财富','',bool(settings.get('news_eastmoney',True)))
+        # 6 个源合并成「热点资讯」后，设备上不再逐个列源，点进去单独开关
+        on_count=sum(1 for key,_ in NEWS_LABELS if settings.get(key,True))
+        row(2,'资讯来源',f'{on_count}/{len(NEWS_LABELS)} 开启')
+        row(3,'轮播停留',f"{settings.get('carousel_seconds',30)} 秒")
         row(4,'模块图片',photo_name('panel_photo'))
         row(5,'账户与上传','手机管理')
-        hint='金融资讯每小时更新 · Codex 由电脑同步'
+        hint='热点资讯 30 分钟更新 · 秒数可扫右侧二维码精调'
     d.text((300,679),hint,font=font(15),fill=80,anchor='mt')
     if not power_available:
         d.text((300,705),'电源键未识别时可轻触屏幕唤醒',font=font(13),fill=100,anchor='mt')
@@ -1264,6 +1294,24 @@ def render_module_picker(config):
     icon_button(d,(214,728,386,777),'phone')
     return image
 
+def render_source_picker(config):
+    # 6 个新闻源逐个开关：关掉的源既不抓取也不上首页，剩下的自动重新排
+    settings=config.get('settings') or {}
+    image,d=section_frame('资讯来源','轻触开启或关闭 · 全部关闭则只看缓存')
+    for index,(key,label) in enumerate(NEWS_LABELS):
+        box=SOURCE_ROWS[index]; x0,y0,x1,y1=box; middle=(y0+y1)//2
+        on=bool(settings.get(key,True))
+        d.rounded_rectangle(box,radius=6,outline=0 if on else 140,width=2 if on else 1)
+        d.text((48,middle),label,font=font(21,True),fill=0 if on else 110,anchor='lm')
+        d.text((500,middle),'开启' if on else '关闭',font=font(17),fill=70 if on else 120,anchor='rm')
+        checkbox(d,520,middle-14,28,on)
+    # 提示文字自动落在最后一行下面，行数多的时候不挤
+    tip_y=_SOURCE_TOP+len(NEWS_LABELS)*_SOURCE_ROW+6
+    if tip_y<716: d.text((300,tip_y),'改动会在下一次抓取时生效',font=font(15),fill=90,anchor='mt')
+    icon_button(d,(30,728,202,777),'back')
+    icon_button(d,(214,728,386,777),'phone')
+    return image
+
 def render_sleep_photo(path,system=False):
     from PIL import ImageOps
     image=Image.new('L',(600,800),255)
@@ -1274,7 +1322,10 @@ def render_sleep_photo(path,system=False):
     except OSError: pass
     return image
 
-def render(config, state, current=None):
+# 首页资讯区一屏显示几条（同时也是轮播的翻页步长）
+HOME_NEWS_PER_PAGE=6
+
+def render(config, state, current=None, news_page=0):
     current=current or now()
     settings=config.get('settings') or {}
     time_format=settings.get('time_format','24')
@@ -1344,21 +1395,52 @@ def render(config, state, current=None):
         text(356,y+10,title,18)
         if i<2: d.line((356,y+41,570,y+41),fill=215,width=1)
     rule(330)
-    text(30,346,'AI 金融资讯',23,True)
-    news_sources=[label for key,label in (('news_wallstreetcn','华尔街见闻'),('news_eastmoney','东方财富')) if settings.get(key,True)]
+    # ── 热点资讯标题行 ──
+    # 所有元素共用同一条垂直中线（row_y），全部用 anchor='lm'（垂直居中）绘制，
+    # 字号统一 13，这样时间/页码/+N 天然落在一条线上，不会再高低不齐：
+    #   标题(左) → 更新时间 → 页码 → +N 内容 → 设置图标 → 刷新图标(右)
+    row_y=357
+    d.text((30,row_y),'热点资讯',font=font(22,True),fill=0,anchor='lm')
+    news_sources=[label for key,label in NEWS_LABELS if settings.get(key,True)]
     news=enabled_news(config,news_items(state.get('news')))
     news_at=parsed_time(state.get('news_at'))
     news_stale=bool(state.get('news_error')) or not news_at or (current-news_at).total_seconds()>7200
-    if news_sources:
-        if state.get('news_refreshing'):
-            rtext(570,352,'正在刷新…',14,fill=0)
-        else: action_icon(d,'refresh',552,359,28)
+    # 分页：一屏 6 条，轮播时按页往后翻，翻到底再回到第 1 页
+    total=max(1,(len(news)+HOME_NEWS_PER_PAGE-1)//HOME_NEWS_PER_PAGE)
+    page=news_page%total if news else 0
+    shown=news[page*HOME_NEWS_PER_PAGE:(page+1)*HOME_NEWS_PER_PAGE]
+    fresh=int(state.get('news_new') or 0)
+    fresh_at=parsed_time(state.get('news_new_at'))
+    just_now=bool(fresh and fresh_at and 0<=(current-fresh_at).total_seconds()<600)
+    refreshing=bool(state.get('news_refreshing'))
+    # 副标题从 x=136 排起；最右 482~570 是两个图标的固定槽位，文字不会挤到图标
+    sub_x=136; sub_face=font(13)
+    if refreshing:
+        d.text((sub_x,row_y),'正在刷新…',font=sub_face,fill=0,anchor='lm')
+    else:
+        if news_at:
+            # 刚在原地刷新出新内容时只显示时分；平时显示「月.日 时:分」
+            head='更新 '+(clock_text(news_at,time_format) if just_now else news_at.strftime('%m.%d')+' '+clock_text(news_at,time_format))
+            d.text((sub_x,row_y),head,font=sub_face,fill=95,anchor='lm')
+            sub_x+=int(d.textlength(head,font=sub_face))+10
+        if total>1:
+            pager_label=f'{page+1}/{total}'
+            d.text((sub_x,row_y),pager_label,font=sub_face,fill=110,anchor='lm')
+            sub_x+=int(d.textlength(pager_label,font=sub_face))+10
+        if just_now: d.text((sub_x,row_y),f'+{fresh} 内容',font=font(13,True),fill=0,anchor='lm')
+    if news_sources: action_icon(d,'refresh',548,row_y,24)
     if news:
-        for i,item in enumerate(news[:6]):
+        for i,item in enumerate(shown):
             y=384+i*26
-            text(30,y,str(i+1),16,True,fill=0 if i<3 else 110,numeric=True)
-            text(58,y,fit_text(d,item['name'],16,445),16)
-            rtext(570,y+1,fmt_news_time(item.get('time'),current,time_format),13,fill=110,numeric=True)
+            # 序号跟着整个列表连续编号（第 2 页从 7 开始），不再是每页都从 1 数起
+            number=str(page*HOME_NEWS_PER_PAGE+i+1)
+            d.text((52,y+1),number,font=font(16,True,numeric=True),fill=0 if i<3 else 110,anchor='rt')
+            # 首页统一一行：GitHub 写「这个仓库是干什么的」，其余写标题；
+            # 右列：榜单条目（GitHub/微博热搜）显示自己的标签（日期/热度），新闻显示时间
+            label=(news_brief(item) or item['name']) if item.get('source')=='GitHub中文' else item['name']
+            right=item.get('date_label') or fmt_news_time(item.get('time'),current,time_format)
+            text(58,y,fit_text(d,label,16,430),16)
+            rtext(570,y+1,right,13,fill=110,numeric=True)
     elif not news_sources:
         text(30,400,'资讯获取已关闭',22,True)
         text(30,438,'可在设置中重新开启',16,fill=80)
@@ -1383,7 +1465,7 @@ def render(config, state, current=None):
     d.line((30,767,570,767),fill=140,width=1)
     stamp=current.strftime('%m-%d')+' '+clock_text(current,time_format)
     text(30,779,f'画面更新 {stamp}',12,fill=70)
-    source_label=' · '.join(news_sources) if news_sources else '已关闭'
+    source_label=f'{len(news_sources)} 个源' if news_sources else '已关闭'
     rtext(570,779,'天气 / Open-Meteo · 资讯 / '+source_label,12,fill=70)
     panel=state.get('panel') or {'kind':'finance'}
     if panel['kind']!='finance':
@@ -1392,5 +1474,5 @@ def render(config, state, current=None):
         d.rectangle((250,773,575,799),fill=255)
         rtext(570,779,'天气 / Open-Meteo · '+panel.get('title',''),12,fill=70)
     else:
-        action_icon(d,'settings',482,359,26)
+        action_icon(d,'settings',494,357,24)
     return image

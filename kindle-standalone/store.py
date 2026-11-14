@@ -22,33 +22,71 @@ def disk_lock(path):
                 msvcrt.locking(handle.fileno(),msvcrt.LK_UNLCK,1)
             else: fcntl.flock(handle.fileno(),fcntl.LOCK_UN)
 
+# ==================== 新闻源配置表（想加源，就在这里加一行） ====================
+# 每个源是一行 dict：
+#   key   : 唯一标识，设置页开关的名字是 news_<key>
+#   name  : 界面/手机后台显示的名字
+#   kind  : 抓取方式，见下面四种
+#   limit : 这个源最多取几条（合并去重前的上限）
+# 四种 kind：
+#   'rss'  通用 RSS/Atom，最省事——找到站点的 RSS 地址，写一行就能加
+#   'html' 网页列表，需要给两个正则参数：item_re 抓(链接,标题)，base 补全域名前缀
+#   'json_douyin' 抖音热榜专用（接口返回 JSON）
+#   'github'  GitHub 中文排行榜专用（要仓库名 + 中文简介，普通 html 抓不出简介）
+#   'wallstreetcn' 华尔街见闻的专用接口
+NEWS_SOURCES=(
+    dict(key='wallstreetcn',name='华尔街见闻',kind='wallstreetcn',url='https://api-one.wallstcn.com/apiv1/content/lives?channel=global-channel&limit=100',limit=20),
+    dict(key='douyin',name='抖音热榜',kind='json_douyin',url='https://www.douyin.com/aweme/v1/web/hot/search/list/',limit=20),
+    # 微博热搜：接口返回 JSON（data.realtime），没有发布时间，所以和 GitHub 一样归入榜单组
+    # 均匀穿插；右侧显示「热度」而不是时间
+    dict(key='weibo',name='微博热搜',kind='json_weibo',url='https://weibo.com/ajax/side/hotSearch',limit=20),
+    # 凤凰网：item_re 抓(链接,标题)，time_re 抓列表里的发布时间（如「今天 16:47」）
+    dict(key='ifeng',name='凤凰网',kind='html',url='https://news.ifeng.com/',limit=20,
+         item_re=r'href="(//news\.ifeng\.com/c/[0-9A-Za-z]+)"[^>]*>(.*?)</a>',base='https:',
+         time_re=r'<time[^>]*>(.*?)</time>'),
+    # GitHub 榜单：kind 改成 github 后走专门的解析，能同时拿到仓库名和一句中文简介
+    dict(key='gitcn',name='GitHub中文',kind='github',url='https://gitcn.org/top-china',limit=20),
+    dict(key='ithome',name='IT之家',kind='rss',url='https://www.ithome.com/rss/',limit=20),
+    dict(key='tmtpost',name='钛媒体',kind='rss',url='https://www.tmtpost.com/rss',limit=20),
+)
+
+# 下面三样全部由 NEWS_SOURCES 自动派生：加源时不用再改任何地方
+NEWS_SETTINGS=tuple('news_'+src['key'] for src in NEWS_SOURCES)                 # 设置的键名
+NEWS_LABELS=tuple((('news_'+src['key']),src['name']) for src in NEWS_SOURCES)   # 键名 -> 界面显示名
+NEWS_DEFAULTS={name:True for name in NEWS_SETTINGS}                             # 新源默认开启
+
 DEFAULT_SETTINGS={
     'time_format':'24',
-    'news_wallstreetcn':True,
-    'news_eastmoney':True,
+    # 每个新闻源一个开关，键名和默认值都由上面的 NEWS_SOURCES 自动生成
+    **NEWS_DEFAULTS,
     'idle_minutes':15,
     'standby_wifi':True,
     'weather_interval':15,
     'full_refresh':10,
     'panel_module':'finance',
     'module_interval':30,
+    'carousel_seconds':30,
     'sleep_display':'calendar',
     'panel_photo':'',
     'standby_photo':'',
 }
-BOOLEAN_SETTINGS={'news_wallstreetcn','news_eastmoney','standby_wifi'}
+BOOLEAN_SETTINGS={'standby_wifi'}|set(NEWS_SETTINGS)
+# 需要「按秒自由填写」的数值设置：key -> (最小,最大)
+RANGE_SETTINGS={'carousel_seconds':(5,300)}
 CHOICE_SETTINGS={
     'time_format':('12','24'),
     'idle_minutes':(0,5,15,30,60),
     'weather_interval':(15,30,60),
     'full_refresh':(5,10,20,50),
-    'panel_module':('finance','news','weibo','usage','photo'),
+    'panel_module':('finance','usage','photo'),
     'module_interval':(15,30,60),
     'sleep_display':('calendar','photo'),
 }
 
 def setting_value(key,value):
+    # 旧的模块代号统一迁到新目录：用量类归 usage，资讯类归 finance（热点资讯）
     if key=='panel_module' and value in ('codex','deepseek'): value='usage'
+    if key=='panel_module' and value in ('news','weibo'): value='finance'
     if key in ('panel_photo','standby_photo'):
         import re
         if isinstance(value,str) and (not value or re.fullmatch(r'[a-f0-9]{24}',value)): return value
@@ -59,6 +97,13 @@ def setting_value(key,value):
         choices=CHOICE_SETTINGS[key]
         for choice in choices:
             if value==choice or str(value)==str(choice): return choice
+    elif key in RANGE_SETTINGS:
+        # 按秒填写的数值设置：必须是整数，且落在允许范围里
+        low,high=RANGE_SETTINGS[key]
+        try: number=int(value)
+        except (TypeError,ValueError): raise ValueError('请填写整数。')
+        if not low<=number<=high: raise ValueError(f'请填 {low} 到 {high} 之间的秒数。')
+        return number
     else: raise ValueError('未知设置项。')
     raise ValueError('设置值无效。')
 
@@ -98,6 +143,9 @@ class Store:
             if not isinstance(result['todos'],list): raise ValueError('待办文件格式不正确。')
             settings=result.setdefault('settings',{})
             if not isinstance(settings,dict): raise ValueError('设置文件格式不正确。')
+            # 清掉已经废弃的设置项（例如已下线的东方财富开关），避免旧配置里一直留着垃圾值
+            for stale in [key for key in settings if key not in DEFAULT_SETTINGS]:
+                settings.pop(stale,None)
             for key,default in DEFAULT_SETTINGS.items():
                 settings[key]=setting_value(key,settings.get(key,default))
             return result

@@ -1,12 +1,12 @@
 """Offline agenda, direct weather, local editing and native display on KT2."""
-import argparse, copy, errno, hashlib, hmac, io, json, logging, math, os, queue, re, secrets
+import argparse, copy, email.utils, errno, hashlib, hmac, html, io, json, logging, math, os, queue, re, secrets
 import signal, socket, ssl, struct, subprocess, sys, threading, time
 import urllib.parse, urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from renderer import ROOT, TZ, now, render, render_news_detail, render_event_detail, future_events, paginate, news_items, font, Image, ImageDraw
-from store import Store, Conflict, atomic_json, CHOICE_SETTINGS, initialize_data
+from store import Store, Conflict, atomic_json, CHOICE_SETTINGS, NEWS_SETTINGS, NEWS_SOURCES, setting_value, initialize_data
 import pages
 import renderer as ui
 import native_input
@@ -18,10 +18,24 @@ from device_control import WiFiManager, PowerKeyListener, KindlePower, Framework
 sys.path.insert(0,str(ROOT/'vendor'))
 LOG=logging.getLogger('kindle')
 PORT=8766
-BUILD='2.0.0'
+BUILD='2.0.2'   # 版本号只升不降：手机端能看到设备当前跑的是哪一版
 STANDBY_BATTERY_SECONDS=30
 BROWSER_UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36'
 AI_KW=re.compile(r'\bAI\b|AIGC|AGI\b|人工智能|大模型|OpenAI|DeepSeek|ChatGPT|智能体|算力|英伟达|NVIDIA|机器人|Anthropic|黄仁勋|具身智能|商汤|智谱|月之暗面|Kimi|豆包|通义|文心|Sora|Copilot',re.I)
+
+# ==================== 新闻源配置表已移到 store.py ====================
+# 为了让「加一行就能加源」成立，并且能被无线更新推送，配置表放在 store.py 顶部。
+# 加源：只改 store.py 里 NEWS_SOURCES 那一行，设置开关、手机后台、抓取循环都会自动跟上。
+# HTML 源要过滤掉的导航类文字（标题完全等于这些词就丢弃）
+NAV_WORDS={'首页','登录','注册','搜索','订阅','更多','下一页','上一页','客户端','关于我们','版权声明','RSS订阅','视频直播','财经娱乐'}
+# GitHub 榜单没有发布时间，放哪儿由这一个开关决定：
+#   'spread' 均匀穿插进资讯列表（默认，大约每屏出现 1 个仓库）
+#   'bottom' 全部排在列表最后
+#   'top'    全部排在列表最前
+GITHUB_PLACE='spread'
+# 榜单型源：没有真实发布时间（time=0），不能按时间排，由 place_github 统一均匀穿插；
+# 想让某个榜单不参与穿插（沉到列表最后），把它的名字从这里删掉即可
+BOARD_SOURCES=('微博热搜','GitHub中文')
 
 class TouchTap:
     """Emit once on finger release, never repeatedly while holding a button."""
@@ -114,6 +128,26 @@ class Device:
             self.framework_bridge.close()
             command(['initctl','start','lab126_gui'])
             self.gui_stopped=False
+
+    def go_home(self):
+        """离开看板时明确打开 Kindle 原厂主页。
+
+        看板为了独占屏幕把 lab126_gui 整个停掉了（主页、书架都在这个服务里），
+        所以退出时必须把它启动回来；启动后系统不一定会回到主页（可能停在上次的浏览器），
+        因此再显式让 appmgrd 打开原生主页。服务刚起来时 appmgrd 可能还没就绪，重试几次。
+        """
+        self.restore_gui()
+        for attempt in range(6):
+            time.sleep(1)
+            try:
+                code,output=command(['lipc-set-prop','com.lab126.appmgrd','start','app://com.lab126.booklet.home'],timeout=10)
+            except (OSError,subprocess.TimeoutExpired) as error:
+                LOG.warning('HOME_OPEN_RETRY %s',type(error).__name__); continue
+            if code==0:
+                LOG.info('HOME_OPEN_OK attempt=%s',attempt+1); return True
+            LOG.info('HOME_OPEN_RETRY code=%s %s',code,output[:80])
+        LOG.warning('HOME_OPEN_FAILED 原生界面已恢复，但没能切到主页')
+        return False
 
     def prepare_standby_refresh(self):
         # Give the OS screensaver transition time to finish before taking
@@ -343,6 +377,10 @@ class Application:
         self.news_return='dashboard'
         self.news_list_page=0
         self.news_list_total=1
+        # 首页「热点资讯」轮播：当前第几页、一共几页、上一次翻页的时刻
+        self.news_carousel_page=0
+        self.news_carousel_total=1
+        self.news_carousel_at=time.monotonic()
         self.event_item=None
         self.event_confirm=False
         self.event_revision=0
@@ -399,8 +437,9 @@ class Application:
         return self.config.get('settings',{})
 
     def news_sources_enabled(self,config=None):
+        # 6 个源里只要还有一个开着，就算资讯功能可用；全关则只显示缓存
         settings=(config or self.config).get('settings',{})
-        return settings.get('news_wallstreetcn',True) or settings.get('news_eastmoney',True)
+        return any(settings.get(key,True) for key in ui.NEWS_KEYS)
 
     def note_activity(self):
         self.last_activity=time.monotonic()
@@ -499,46 +538,243 @@ class Application:
             if self.mode=='screensaver': self.requests.put('standby_refresh')
         return changed
 
-    def fetch_wallstreetcn(self,ai_only=True):
-        data=json.loads(self.fetch_text('https://api-one.wallstcn.com/apiv1/content/lives?channel=global-channel&limit=100',ua=BROWSER_UA))
+    def fetch_wallstreetcn(self,ai_only=True,limit=20):
+        data=json.loads(self.news_get('https://api-one.wallstcn.com/apiv1/content/lives?channel=global-channel&limit=100'))
         items=[]
         for raw in (data.get('data') or {}).get('items') or []:
             name=(raw.get('title') or raw.get('content_text') or '').strip()
             link=(raw.get('uri') or '').strip()
             if not name or not link or (ai_only and not AI_KW.search(name)): continue
             items.append({'name':name,'content':raw.get('content_text') or name,'url':link,'time':raw.get('display_time') or 0,'source':'华尔街见闻'})
-            if len(items)>=50: break
+            if len(items)>=limit: break
         return items
 
-    def fetch_eastmoney(self,ai_only=True):
-        param={'uid':'','keyword':'AI 金融','type':['cmsArticleWebOld'],'client':'web','clientType':'web','clientVersion':'curr','param':{'cmsArticleWebOld':{'searchScope':'default','sort':'time','pageIndex':1,'pageSize':20,'preTag':'','postTag':''}}}
-        if not ai_only: param['keyword']='新闻'
-        raw_text=self.fetch_text('https://search-api-web.eastmoney.com/search/jsonp?cb=cb&param='+urllib.parse.quote(json.dumps(param,ensure_ascii=False)),ua=BROWSER_UA)
-        data=json.loads(raw_text[raw_text.index('(')+1:raw_text.rindex(')')])
+    # ---------- 通用抓取工具（第 2 步新增，供所有新闻源共用） ----------
+    def news_get(self,url,referer=None):
+        # 带浏览器身份的 GET，返回文本。证书优先用项目自带的，缺文件时退回系统证书
+        ca_file=self.root/'assets/cacert.pem'
+        context=ssl.create_default_context(cafile=str(ca_file)) if ca_file.exists() else ssl.create_default_context()
+        headers={'User-Agent':BROWSER_UA}
+        if referer: headers['Referer']=referer
+        request=urllib.request.Request(url,headers=headers)
+        with urllib.request.urlopen(request,context=context,timeout=25) as response:
+            return response.read(2*1024*1024).decode('utf-8','ignore')
+
+    def parse_rss(self,text,name,limit):
+        # 解析 RSS 2.0 / Atom 两种格式，返回统一结构
+        import xml.etree.ElementTree as ET
+        root=ET.fromstring(text.encode('utf-8'))
+        atom='{http://www.w3.org/2005/Atom}'
+        entries=root.findall('.//item') or root.findall('.//'+atom+'entry')
         items=[]
-        for raw in (data.get('result') or {}).get('cmsArticleWebOld') or []:
-            name=(raw.get('title') or '').strip()
-            link=(raw.get('url') or '').strip()
-            if not name or not link: continue
-            try: stamp=int(datetime.strptime(raw.get('date',''),'%Y-%m-%d %H:%M:%S').replace(tzinfo=TZ).timestamp())
-            except ValueError: stamp=0
-            items.append({'name':name,'url':link,'time':stamp,'source':'东方财富'})
-        return items[:50]
+        for entry in entries:
+            def field(tag):
+                node=entry.find(tag)
+                if node is None: node=entry.find(atom+tag)
+                return (node.text or '').strip() if node is not None else ''
+            title=field('title'); link=field('link')
+            if not link:  # Atom 的链接写在属性里
+                node=entry.find(atom+'link')
+                if node is not None: link=(node.get('href') or '').strip()
+            if not title or not link: continue
+            # 时间：RSS 用 pubDate，Atom 用 published/updated
+            stamp=0
+            raw_time=field('pubDate') or field('published') or field('updated')
+            if raw_time:
+                try: stamp=int(email.utils.parsedate_to_datetime(raw_time).timestamp())
+                except (TypeError,ValueError):
+                    try: stamp=int(datetime.fromisoformat(raw_time.replace('Z','+00:00')).timestamp())
+                    except (TypeError,ValueError): stamp=0
+            # 正文摘要：description 可能带 HTML，去掉标签
+            body=field('description') or field('summary') or ''
+            content=re.sub(r'\s+',' ',re.sub(r'<[^>]+>',' ',html.unescape(body))).strip()
+            items.append({'name':title,'content':content or title,'url':link,'time':stamp,'source':name})
+            if len(items)>=limit: break
+        return items
+
+    def parse_cn_time(self,raw):
+        # 把网页上中文写法的时间换成时间戳，认不出来的返回 0（当作「没有时间」）
+        # 支持：刚刚 / 36分钟前 / 2小时前 / 今天 16:47 / 昨天 23:10 / 11-12 08:30
+        raw=(raw or '').strip()
+        if not raw: return 0
+        current=now()
+        found=re.search(r'(\d+)\s*分钟前',raw)
+        if found: return int((current-timedelta(minutes=int(found.group(1)))).timestamp())
+        found=re.search(r'(\d+)\s*小时前',raw)
+        if found: return int((current-timedelta(hours=int(found.group(1)))).timestamp())
+        if '刚刚' in raw: return int(current.timestamp())
+        # 只有月日没有年份时，按今年算
+        found=re.search(r'(?:(\d{4})-)?(\d{1,2})-(\d{1,2})\s+(\d{1,2}):(\d{2})',raw)
+        if found:
+            year=int(found.group(1) or current.year)
+            try: return int(datetime(year,int(found.group(2)),int(found.group(3)),int(found.group(4)),int(found.group(5)),tzinfo=TZ).timestamp())
+            except ValueError: return 0
+        found=re.search(r'(今天|昨天)?\s*(\d{1,2}):(\d{2})',raw)
+        if found:
+            base=current-timedelta(days=1) if found.group(1)=='昨天' else current
+            try: return int(base.replace(hour=int(found.group(2)),minute=int(found.group(3)),second=0,microsecond=0).timestamp())
+            except ValueError: return 0
+        return 0
+
+    def parse_html(self,text,name,item_re,base,limit,time_re=None):
+        # 用正则从网页里挖出 (链接, 标题)；只适合列表结构固定的站
+        # time_re 可选：给一个能抓到「时间文字」的正则，就能拿到真实发布时间，抓不到就是 0
+        items=[]; seen=set()
+        matches=list(re.finditer(item_re,text,re.S))
+        for index,match in enumerate(matches):
+            link,raw_title=match.group(1),match.group(2)
+            title=re.sub(r'\s+',' ',re.sub(r'<[^>]+>','',raw_title)).strip()
+            if not title or title in NAV_WORDS or len(title)<4: continue
+            if not link.startswith('http'): link=base+link
+            link=link.replace('http://','https://',1) if link.startswith('http://') else link
+            if link in seen: continue
+            seen.add(link)
+            # 时间：从本条标题到下一个条目之间的那段 HTML 里找时间文字
+            stamp=0
+            if time_re:
+                end=matches[index+1].start() if index+1<len(matches) else len(text)
+                found=re.search(time_re,text[match.end():end],re.S)
+                if found: stamp=self.parse_cn_time(re.sub(r'<[^>]+>',' ',found.group(1)))
+            items.append({'name':title,'content':title,'url':link,'time':stamp,'source':name})
+            if len(items)>=limit: break
+        return items
+
+    def parse_github(self,text,name,limit):
+        # GitHub 中文排行榜专用解析：一条榜单要两个信息——仓库名 + 这个仓库是干什么的
+        # 页面结构是「仓库链接 → 星标数 → 一段中文简介(div class 里带 line-clamp-6)」
+        # 所以按链接位置把整页切成一段一段，每段里再找那一段简介，天然不会错位
+        items=[]
+        links=list(re.finditer(r'href="(https://github\.com/[^/"]+/[^/"]+)"',text))
+        for index,match in enumerate(links):
+            # 本段的结尾 = 下一个链接的开始，这样一段里只会有自己那条仓库的简介
+            end=links[index+1].start() if index+1<len(links) else len(text)
+            block=text[match.end():end]
+            link=match.group(1).split('?')[0].rstrip('/')
+            # 仓库全名取链接里的 owner/repo 两段，例如 labuladong/fucking-algorithm
+            parts=link.replace('https://github.com/','').split('/')
+            if len(parts)<2 or not parts[0] or not parts[1]: continue
+            repo=parts[0]+'/'+parts[1]
+            # 简介：站点已经给中文 AI 总结，直接取；抓不到就留空（后面用仓库名占位）
+            desc=''
+            found=re.search(r'line-clamp-6[^"]*">(.*?)</div>',block,re.S)
+            if found:
+                desc=html.unescape(re.sub(r'<[^>]+>',' ',found.group(1)))
+                desc=re.sub(r'\s+',' ',desc).strip()
+            # 站点把最后更新时间写成「更新于 1 年前」或直接「3 个月前」「19 天前」
+            # 这里把相对时间换算成具体日期再显示：今天显示时分，今年内显示 月/日，往年显示年份
+            label=''
+            stamps=re.findall(r'(\d+)\s*(秒|分钟|小时|天|个?月|年)前',block)
+            if stamps:
+                number,unit=stamps[-1]; number=int(number); moment=now()
+                if unit=='秒': moment=moment-timedelta(seconds=number)
+                elif unit=='分钟': moment=moment-timedelta(minutes=number)
+                elif unit=='小时': moment=moment-timedelta(hours=number)
+                elif unit=='天': moment=moment-timedelta(days=number)
+                elif unit in ('月','个月'): moment=moment-timedelta(days=30*number)
+                else: moment=moment-timedelta(days=365*number)
+                # 规则：只要是本年度的，一律显示 月/日；跨年的显示两位年份+年
+                if moment.year==now().year: label=f'{moment.month}/{moment.day}'
+                else: label=f'{moment.year%100}年'
+            # time 给 0：榜单本身没有发布时间，标记成「无时间」，合并排序时会排在新闻后面
+            items.append({'name':repo,'content':desc or repo,'url':link,'time':0,'source':name,'date_label':label})
+            if len(items)>=limit: break
+        return items
+
+    def fetch_source(self,src):
+        # 按配置表里的一种 kind 去抓，统一返回 5 字段结构
+        kind=src['kind']; name=src['name']; limit=src.get('limit',20)
+        if kind=='wallstreetcn': return self.fetch_wallstreetcn(ai_only=False,limit=limit)
+        if kind=='json_douyin':
+            raw=json.loads(self.news_get(src['url'],referer='https://www.douyin.com/'))
+            stamp=int(time.time()); items=[]
+            for row in (raw.get('data') or {}).get('word_list') or []:
+                title=(row.get('word') or '').strip()
+                if not title: continue
+                items.append({'name':title,'content':title,
+                              'url':'https://www.douyin.com/hot/'+str(row.get('sentence_id') or ''),
+                              'time':int(row.get('event_time') or stamp),'source':name})
+                if len(items)>=limit: break
+            return items
+        if kind=='json_weibo':
+            # 微博热搜榜：data.realtime[]，广告位跳过；榜单没有发布时间（time=0），
+            # 热度值放进 date_label 给首页右列显示，排序走 place_github 的榜单穿插
+            raw=json.loads(self.news_get(src['url'],referer='https://weibo.com/'))
+            items=[]
+            for row in (raw.get('data') or {}).get('realtime') or []:
+                if not isinstance(row,dict) or row.get('is_ad'): continue
+                title=str(row.get('word') or row.get('note') or '').strip()[:150]
+                if not title: continue
+                rank=len(items)+1
+                try: heat=int(row.get('num') or 0)
+                except (TypeError,ValueError): heat=0
+                if heat>=100000000: label=('%.1f'%(heat/1e8)).rstrip('0').rstrip('.')+'亿'
+                elif heat>=10000: label=('%.1f'%(heat/10000)).rstrip('0').rstrip('.')+'万'
+                elif heat>0: label=str(heat)
+                else: label='#'+str(rank)
+                items.append({'name':title,'content':title+'\n热度：'+(str(heat) if heat else '—'),
+                              'url':'https://s.weibo.com/weibo?q='+urllib.parse.quote('#'+title+'#'),
+                              'time':0,'source':name,'date_label':label[:20]})
+                if len(items)>=limit: break
+            return items
+        text=self.news_get(src['url'])
+        if kind=='rss': return self.parse_rss(text,name,limit)
+        if kind=='html': return self.parse_html(text,name,src['item_re'],src.get('base',''),limit,src.get('time_re'))
+        if kind=='github': return self.parse_github(text,name,limit)
+        return []
 
     def fetch_news(self,ai_only=True):
+        # 多源合并：把配置表里所有开启的源都抓一遍，合并后去重、按时间倒序
+        # ai_only 参数保留但不再使用（热点资讯要全量，不按主题过滤）
         config=self.store.read()
         settings=config.get('settings',{})
-        errors=[]
-        for key,label,fetcher in (('news_wallstreetcn','华尔街见闻',self.fetch_wallstreetcn),('news_eastmoney','东方财富',self.fetch_eastmoney)):
-            if not settings.get(key,True): continue
+        merged=[]; errors=[]; ok=0
+        for src in NEWS_SOURCES:
+            if not settings.get('news_'+src['key'],True): continue
             try:
-                items=fetcher() if ai_only else fetcher(ai_only=False)
-                if items: return items
-                errors.append(label+'暂无相关资讯')
+                items=self.fetch_source(src)
+                if items: ok+=1
+                merged.extend(items)
+                LOG.info('NEWS_SRC %s=%s',src['name'],len(items))
             except Exception as error:
-                errors.append(label+'：'+type(error).__name__)
-        if not errors: return []
-        raise ValueError('资讯获取失败（'+'，'.join(errors)+'）')
+                errors.append(src['name']+'：'+type(error).__name__)
+                LOG.info('NEWS_SRC_FAIL %s %s',src['name'],error)
+        # 去重：链接（去掉 ?# 参数和末尾斜杠）或标题（去空白取前 30 字）重复的只留一条
+        seen_url=set(); seen_title=set(); uniq=[]
+        for item in merged:
+            url_key=re.sub(r'[?#].*$','',item.get('url') or '').rstrip('/').lower()
+            title_key=re.sub(r'\s+','',item.get('name') or '')[:30].lower()
+            if not title_key or url_key in seen_url or title_key in seen_title: continue
+            seen_url.add(url_key); seen_title.add(title_key); uniq.append(item)
+        # 排序：有发布时间的按新→旧排前面；GitHub 榜单没有发布时间（time=0），整体排到新闻之后
+        # 两个键：先比「有没有时间」，再比「时间大小」；同一批无时间的保持榜单原顺序（star 排名）
+        uniq.sort(key=lambda row:(1 if int(row.get('time') or 0) else 0,int(row.get('time') or 0)),reverse=True)
+        LOG.info('NEWS_MERGE raw=%s uniq=%s sources_ok=%s',len(merged),len(uniq),ok)
+        if uniq: return uniq
+        if errors: raise ValueError('资讯获取失败（'+'，'.join(errors)+'）')
+        return []
+
+    def place_github(self,items):
+        # 榜单型源（GitHub / 微博热搜）没有发布时间，靠时间排序只能沉到最后
+        # 所以单独摆放：默认均匀穿插，翻页时每屏都能碰到榜单内容，又不挤占新闻的位置
+        # 两个榜单交替出现（一条微博、一条仓库……），避免开头全是同一个源
+        if GITHUB_PLACE=='bottom': return items
+        board=[item for item in items if item.get('source') in BOARD_SOURCES]
+        news=[item for item in items if item.get('source') not in BOARD_SOURCES]
+        if not board or not news: return items
+        if GITHUB_PLACE=='top': return board+news
+        mixed=[]; queues={name:[] for name in BOARD_SOURCES}
+        for item in board: queues[item.get('source')].append(item)
+        while any(queues.values()):
+            for name in BOARD_SOURCES:
+                if queues[name]: mixed.append(queues[name].pop(0))
+        step=max(1,len(news)//len(mixed))   # 每隔这么多条新闻，插一条榜单内容
+        out=[]; index=0
+        for order,item in enumerate(news):
+            out.append(item)
+            if index<len(mixed) and (order+1)%step==0:
+                out.append(mixed[index]); index+=1
+        out.extend(mixed[index:])
+        return out
 
     def update_news(self):
         config=self.store.read()
@@ -547,10 +783,26 @@ class Application:
             return
         items=news_items(self.fetch_news())
         with self.lock:
+            # 记下更新前有哪些链接，好数出这一轮到底多了几条新内容
+            known={str(row.get('url') or '') for row in self.state.get('news') or [] if isinstance(row,dict)}
             items=ui.merge_news_history(self.state.get('news'),items)
-            self.state.update(news=items,news_at=now().isoformat(),news_error='')
+            items=self.place_github(items)
+            # 本轮新增的条目稳定提到列表最前：刷新后第 1 页一定是刚抓到的新内容。
+            # 只动这一轮的新条目、保持它们内部的时间倒序，下一轮刷新它们就回归常规排序
+            fresh_rows=[row for row in items if str(row.get('url') or '') not in known]
+            if fresh_rows:
+                fresh_urls={str(row.get('url') or '') for row in fresh_rows}
+                items=fresh_rows+[row for row in items if str(row.get('url') or '') not in fresh_urls]
+            fresh=len(fresh_rows)
+            stamp=now().isoformat()
+            self.state.update(news=items,news_at=stamp,news_error='')
+            # 首页标题后会显示「+N 条新内容」；轮播翻页时清零，10 分钟为兜底上限
+            if fresh: self.state.update(news_new=fresh,news_new_at=stamp)
+            else: self.state.update(news_new=0,news_new_at='')
             atomic_json(self.data/'news-cache.json',{'news':items,'news_at':self.state['news_at']})
             self.news_cache_dirty=False
+        # 抓到新内容只在原地刷新列表，不把用户正在看的那一页跳回第 1 页
+        # （页码保持不变；万一新内容变少，渲染时会自动按总页数取模，不会越界）
         LOG.info('NEWS_OK count=%s',len(items))
         self.redraw.set()
 
@@ -575,7 +827,8 @@ class Application:
             finally:
                 with self.lock: self.state['news_refreshing']=False
                 if not self.standby.is_set(): self.redraw.set()
-            self.news_wake.wait(3600)
+            # 30 分钟抓一轮（1800 秒）；改这个数字就能调整抓取周期
+            self.news_wake.wait(1800)
             self.news_wake.clear()
 
     def module_loop(self):
@@ -673,8 +926,10 @@ class Application:
         self.config=new; self.note_activity()
         before=old.get('settings',{}); after=new['settings']
         if old.get('city')!=new.get('city') or before.get('weather_interval')!=after['weather_interval']: self.weather_wake.set()
-        if any(before.get(k)!=after.get(k) for k in ('panel_module','news_wallstreetcn','news_eastmoney')): self.news_wake.set()
-        if any(before.get(k)!=after.get(k) for k in ('panel_module','module_interval','news_wallstreetcn','news_eastmoney')): self.module_wake.set()
+        # 开关了任何一个来源（或换了中间模块）都立刻重抓一次，不用等下一轮 30 分钟
+        if any(before.get(k)!=after.get(k) for k in ('panel_module',)+ui.NEWS_KEYS): self.news_wake.set()
+        if any(before.get(k)!=after.get(k) for k in ('panel_module','module_interval')+ui.NEWS_KEYS): self.module_wake.set()
+        if before.get('carousel_seconds')!=after.get('carousel_seconds'): self.news_carousel_at=time.monotonic()
         if self.mode in ('module','news_history','news','module_picker'): self.requests.put('dashboard')
         self.redraw.set()
         if self.standby.is_set(): self.requests.put('standby_refresh')
@@ -896,6 +1151,12 @@ class Application:
                 if index<len(modules.CATALOG): return ('select_module',modules.CATALOG[index][0])
             if 30<=x<202 and 728<=y<777: return self.module_return
             if 214<=x<386 and 728<=y<777: return 'pair'
+        elif mode=='source_picker':
+            # 6 行各管一个源，点哪行翻哪行的开关
+            for index,box in enumerate(ui.SOURCE_ROWS):
+                if ui.inside(x,y,box): return ('toggle_source',ui.NEWS_LABELS[index][0])
+            if 30<=x<202 and 728<=y<777: return 'settings'
+            if 214<=x<386 and 728<=y<777: return 'pair'
         elif mode=='photo_picker':
             for i,box in enumerate(ui.PHOTO_BOXES):
                 if ui.inside(x,y,box) and i<len(self.shown_photos): return ('photo_select',self.shown_photos[i]['id'])
@@ -999,6 +1260,7 @@ class Application:
             state['system_sleep']=self.system_sleeping or self.system_suspend_pending
             return ui.render_screensaver(config,state,self.standby_moment if self.system_sleeping else current,power_available=self.power_available)
         if self.mode=='module_picker': return ui.render_module_picker(config)
+        if self.mode=='source_picker': return ui.render_source_picker(config)
         if self.mode=='photo_picker':
             photos=self.modules.photos()
             total=max(1,(len(photos)+3)//4); page=min(self.photo_page,total-1)
@@ -1043,14 +1305,23 @@ class Application:
                 else: self.shown_events=copy.deepcopy(selected)
             if self.mode=='todos': return ui.render_todos(config,page,self.todo_message)
             return ui.render_agenda(config,page,self.agenda_day,time_format=time_format)
-        try: result=render(config,state,current=current)
+        feed=ui.enabled_news(config,news_items(state.get('news')))
+        per=ui.HOME_NEWS_PER_PAGE
+        carousel_total=max(1,(len(feed)+per-1)//per)
+        carousel_page=self.news_carousel_page%carousel_total if feed else 0
+        self.news_carousel_total=carousel_total
+        try: result=render(config,state,current=current,news_page=carousel_page)
         except (ValueError,TypeError,KeyError,IndexError,OverflowError,AttributeError):
             LOG.exception('Feed layout failed; keeping the local agenda available')
             state.update(weather=None,news=[],news_at=None,news_error='资讯暂不可用')
             result=render(config,state,current=current)
         if capture:
-            feed=state['panel'].get('items',[])[:10 if state['panel']['kind']=='weibo' else 5] if state['panel']['kind'] in ('news','weibo') else news_items(state.get('news'))[:6]
-            self.shown_news=copy.deepcopy(feed)
+            feed=state['panel'].get('items',[])[:10 if state['panel']['kind']=='weibo' else 5] if state['panel']['kind'] in ('news','weibo') else news_items(state.get('news'))
+            if state['panel']['kind'] in ('news','weibo'): shown=feed
+            else:
+                # 首页只显示当前轮播页的 6 条，点击序号要对应屏幕上那一条
+                shown=ui.enabled_news(config,feed)[carousel_page*per:(carousel_page+1)*per]
+            self.shown_news=copy.deepcopy(shown)
             self.shown_events=copy.deepcopy(future_events(config,current)[:5])
             self.shown_todos=copy.deepcopy(ui.todo_items(config,False)[:3])
             self.shown_revision=config['revision']
@@ -1069,7 +1340,13 @@ class Application:
         if action=='update_restart':
             self.restart_update=True; self.stop.set(); return
         if self.updating: return
-        if action=='quit': self.stop.set(); return
+        if action=='quit':
+            # 右下角箭头 = 回到 Kindle 原厂桌面：先把原生界面恢复并切到主页，再结束进程。
+            # 结束进程本身不重启系统；看起来像重启是因为 lab126_gui 必须先停后启。
+            if self.device:
+                try: self.device.go_home()
+                except Exception: LOG.exception('HOME_OPEN_ERROR')
+            self.stop.set(); return
         if action=='standby_refresh':
             if self.mode=='screensaver': self.redraw.set()
             return
@@ -1102,6 +1379,21 @@ class Application:
         if action=='module_picker':
             self.module_return='settings' if self.mode=='settings' else 'dashboard'
             self.mode='module_picker'; self.redraw.set(); return
+        if action=='source_picker':
+            self.mode='source_picker'; self.redraw.set(); return
+        if isinstance(action,tuple) and action[0]=='toggle_source':
+            old=self.store.read()
+            try: new=self.store.change(old['revision'],'setting',dict(key=action[1],value=not old['settings'].get(action[1],True)))
+            except (ValueError,Conflict): return
+            self.settings_changed(old,new); return
+        if action=='cycle_carousel':
+            # 设备上点一下就在 15/30/45/60/90/120 秒之间轮换；想填任意秒数用手机后台
+            steps=ui.CAROUSEL_STEPS; now_value=int(self.preferences().get('carousel_seconds',30))
+            following=next((step for step in steps if step>now_value),steps[0])
+            old=self.store.read()
+            try: new=self.store.change(old['revision'],'setting',dict(key='carousel_seconds',value=following))
+            except (ValueError,Conflict): return
+            self.settings_changed(old,new); return
         if isinstance(action,tuple) and action[0]=='settings_tab':
             if action[1] in ui.SETTINGS_TABS: self.settings_page=action[1]
             self.redraw.set(); return
@@ -1241,8 +1533,9 @@ class Application:
                 if self.news_item.get('source')=='微博热搜':
                     self.open_weibo_detail(self.news_item); return
                 body=self.news_item.get('content') or self.news_item.get('name') or ''
-                if self.news_item.get('source')=='东方财富':
-                    body+='\n（全文较长，请用手机打开资讯列表，点进原文查看。）'
+                if self.news_item.get('source')=='GitHub中文':
+                    # 仓库条目：点进去先看到仓库全名和链接，下面才是这个仓库是干什么的中文介绍
+                    body=self.news_item.get('name','')+'\n'+self.news_item.get('url','')+'\n\n'+body
                 self.news_pages=paginate(body,size=24,per_page=16)
                 self.news_page=0; self.mode='news'; self.redraw.set()
         elif action=='weibo_detail_refresh' and self.mode=='news':
@@ -1364,6 +1657,7 @@ class Application:
     def display_loop(self):
         previous_minute=None
         previous_timer=None
+        previous_mode=None
         next_cache_prune=0
         next_idle_check=0
         self.redraw.set()
@@ -1385,6 +1679,10 @@ class Application:
                 LOG.info('USB_STORAGE_UNAVAILABLE exiting dashboard')
                 self.request_stop()
                 break
+            if self.mode!=previous_mode:
+                # 刚回到首页时重新计时，避免一进门就被轮播翻走
+                if self.mode=='dashboard': self.news_carousel_at=time.monotonic()
+                previous_mode=self.mode
             if not self.standby.is_set():
                 if self.pomodoro.tick():
                     self.note_activity()  # Show completion before restarting the idle countdown.
@@ -1394,6 +1692,16 @@ class Application:
                 if timer_stamp!=previous_timer:
                     if self.mode in ('dashboard','pomodoro'): self.redraw.set()
                     previous_timer=timer_stamp
+                # 首页热点资讯轮播：停够设定秒数就翻下一页，翻到底回到第 1 页
+                if self.mode=='dashboard' and self.news_carousel_total>1:
+                    gap=max(5,int(self.preferences().get('carousel_seconds',30)))
+                    if time.monotonic()-self.news_carousel_at>=gap:
+                        self.news_carousel_at=time.monotonic()
+                        self.news_carousel_page=(self.news_carousel_page+1)%self.news_carousel_total
+                        # 翻页即清掉「+N 内容」角标：新内容已经进了列表，角标不必跟着翻页
+                        with self.lock:
+                            if self.state.get('news_new'): self.state.update(news_new=0,news_new_at='')
+                        self.redraw.set()
                 if time.monotonic()>=next_cache_prune:
                     try: self.prune_news_cache()
                     except OSError: LOG.warning('News cache cleanup unavailable')
@@ -1403,7 +1711,7 @@ class Application:
                     next_idle_check=time.monotonic()+1
             moment=now()
             stamp=self.display_stamp(moment)
-            modes=('dashboard','pair','news','news_history','pomodoro','event','weather','todos','agenda','calendar','form','settings','wifi','screensaver','module','module_picker','photo_picker')
+            modes=('dashboard','pair','news','news_history','pomodoro','event','weather','todos','agenda','calendar','form','settings','wifi','screensaver','module','module_picker','source_picker','photo_picker')
             if self.mode in modes and (stamp!=previous_minute or self.redraw.is_set()):
                 try:
                     self.drawing=True
@@ -1674,7 +1982,9 @@ class Application:
                     old=app.store.read(); action=values.get('action'); updates={}; target='/modules'; message='已保存，Kindle 会自动更新。'
                     if action=='module': updates={k:values.get(k) for k in ('panel_module','module_interval')}
                     elif action=='settings':
-                        updates={k:values.get(k) for k in ('time_format','weather_interval','full_refresh','idle_minutes','standby_wifi','sleep_display','news_wallstreetcn','news_eastmoney')}
+                        updates={k:values.get(k) for k in ('time_format','weather_interval','full_refresh','idle_minutes','standby_wifi','sleep_display','carousel_seconds')+NEWS_SETTINGS}
+                        # 轮播秒数留空 = 保持当前值不动，避免误填空字符串导致保存失败
+                        if not str(updates.get('carousel_seconds','') or '').strip(): updates.pop('carousel_seconds',None)
                         target='/settings'
                         if updates['sleep_display']=='photo' and not old['settings'].get('standby_photo'): raise ValueError('请先在图片库选一张待机图片。')
                     elif action=='photo_select':
@@ -1762,7 +2072,7 @@ def main():
         application=Application(native=False)
         image=application.frame()
         assert image.size==(600,800) and image.mode=='L'
-        for mode in ('todos','agenda','calendar','weather','news_history','pomodoro','settings','wifi','screensaver','module_picker','module','photo_picker'):
+        for mode in ('todos','agenda','calendar','weather','news_history','pomodoro','settings','wifi','screensaver','module_picker','source_picker','module','photo_picker'):
             application.mode=mode
             assert application.frame().size==(600,800) and application.frame().mode=='L'
         for page in ui.SETTINGS_TABS:
@@ -1794,9 +2104,19 @@ def main():
             changed=store.change(0,'setting',dict(key='time_format',value='12'))
             assert changed['settings']['time_format']=='12'
             assert store.read()['settings']['time_format']=='12'
-            store.change(1,'setting',dict(key='news_wallstreetcn',value=False))
-            store.change(2,'setting',dict(key='news_eastmoney',value=False))
-            assert not ui.enabled_news(store.read(),[dict(name='AI',source='华尔街见闻'),dict(name='AI',source='东方财富')])
+            # 逐个关掉 6 个源，确认 enabled_news 真的把它们过滤掉了（GitHub 的 source 是「GitHub中文」）
+            revision=1
+            for key in NEWS_SETTINGS:
+                store.change(revision,'setting',dict(key=key,value=False)); revision+=1
+            every=[dict(name='x',source=label) for _,label in ui.NEWS_LABELS]
+            assert not ui.enabled_news(store.read(),every)
+            # 再打开一个，只有它应该回来
+            store.change(revision,'setting',dict(key='news_gitcn',value=True))
+            assert [row['source'] for row in ui.enabled_news(store.read(),every)]==['GitHub中文']
+            # 已废弃的东方财富开关不该再出现在配置里
+            assert 'news_eastmoney' not in store.read()['settings']
+            # 轮播秒数的范围校验
+            assert setting_value('carousel_seconds','45')==45
         import PIL, qrcode
         assert qrcode.make('Kindle standalone self-test').convert('L').width>0
         ssl.create_default_context(cafile=str(ROOT/'assets/cacert.pem'))
