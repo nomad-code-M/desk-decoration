@@ -18,7 +18,7 @@ from device_control import WiFiManager, PowerKeyListener, KindlePower, Framework
 sys.path.insert(0,str(ROOT/'vendor'))
 LOG=logging.getLogger('kindle')
 PORT=8766
-BUILD='2.0.2'   # 版本号只升不降：手机端能看到设备当前跑的是哪一版
+BUILD='1.0.0'   # 版本号只升不降：手机端能看到设备当前跑的是哪一版
 STANDBY_BATTERY_SECONDS=30
 BROWSER_UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36'
 AI_KW=re.compile(r'\bAI\b|AIGC|AGI\b|人工智能|大模型|OpenAI|DeepSeek|ChatGPT|智能体|算力|英伟达|NVIDIA|机器人|Anthropic|黄仁勋|具身智能|商汤|智谱|月之暗面|Kimi|豆包|通义|文心|Sora|Copilot',re.I)
