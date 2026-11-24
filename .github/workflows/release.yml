@@ -2,7 +2,15 @@ name: Publish release
 on:
   push:
     branches: [main]
-    paths: ['scripts/build_release.py', '.github/workflows/release.yml']
+    paths:
+      - 'scripts/build_release.py'
+      - '.github/workflows/release.yml'
+      - 'kindle-standalone/**'
+      - 'extensions/**'
+      - 'install.py'
+      - 'requirements.txt'
+      - 'docs/**'
+      - 'CHANGELOG.md'
   workflow_dispatch:
 permissions:
   contents: write
