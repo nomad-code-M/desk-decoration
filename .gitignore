@@ -14,4 +14,5 @@ kindle-standalone/界面预览/
 kindle-standalone/assets/*.ttc
 kindle-standalone/assets/arial*.ttf
 kindle-standalone/assets/msyh*
+.vscode/
 EADME.md
