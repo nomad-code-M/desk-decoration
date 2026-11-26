@@ -7,6 +7,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from renderer import ROOT, TZ, now, render, render_news_detail, render_event_detail, future_events, paginate, news_items, font, Image, ImageDraw
 from store import Store, Conflict, atomic_json, CHOICE_SETTINGS, NEWS_SETTINGS, NEWS_SOURCES, setting_value, initialize_data
+
+import news_fetch, news_sources
+from news_fetch import BROWSER_UA, AI_KW, NAV_WORDS, GITHUB_PLACE, NEWS_INTERVAL
+
+
 import pages
 import renderer as ui
 import native_input
@@ -20,22 +25,7 @@ LOG=logging.getLogger('kindle')
 PORT=8766
 BUILD='1.0.0'   # 版本号只升不降：手机端能看到设备当前跑的是哪一版
 STANDBY_BATTERY_SECONDS=30
-BROWSER_UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36'
-AI_KW=re.compile(r'\bAI\b|AIGC|AGI\b|人工智能|大模型|OpenAI|DeepSeek|ChatGPT|智能体|算力|英伟达|NVIDIA|机器人|Anthropic|黄仁勋|具身智能|商汤|智谱|月之暗面|Kimi|豆包|通义|文心|Sora|Copilot',re.I)
 
-# ==================== 新闻源配置表已移到 store.py ====================
-# 为了让「加一行就能加源」成立，并且能被无线更新推送，配置表放在 store.py 顶部。
-# 加源：只改 store.py 里 NEWS_SOURCES 那一行，设置开关、手机后台、抓取循环都会自动跟上。
-# HTML 源要过滤掉的导航类文字（标题完全等于这些词就丢弃）
-NAV_WORDS={'首页','登录','注册','搜索','订阅','更多','下一页','上一页','客户端','关于我们','版权声明','RSS订阅','视频直播','财经娱乐'}
-# GitHub 榜单没有发布时间，放哪儿由这一个开关决定：
-#   'spread' 均匀穿插进资讯列表（默认，大约每屏出现 1 个仓库）
-#   'bottom' 全部排在列表最后
-#   'top'    全部排在列表最前
-GITHUB_PLACE='spread'
-# 榜单型源：没有真实发布时间（time=0），不能按时间排，由 place_github 统一均匀穿插；
-# 想让某个榜单不参与穿插（沉到列表最后），把它的名字从这里删掉即可
-BOARD_SOURCES=('微博热搜','GitHub中文')
 
 class TouchTap:
     """Emit once on finger release, never repeatedly while holding a button."""
@@ -538,243 +528,34 @@ class Application:
             if self.mode=='screensaver': self.requests.put('standby_refresh')
         return changed
 
+    # 新闻抓取薄封装：规则放在 news_fetch.py，这里保持原有的方法名和签名供外部调用
     def fetch_wallstreetcn(self,ai_only=True,limit=20):
-        data=json.loads(self.news_get('https://api-one.wallstcn.com/apiv1/content/lives?channel=global-channel&limit=100'))
-        items=[]
-        for raw in (data.get('data') or {}).get('items') or []:
-            name=(raw.get('title') or raw.get('content_text') or '').strip()
-            link=(raw.get('uri') or '').strip()
-            if not name or not link or (ai_only and not AI_KW.search(name)): continue
-            items.append({'name':name,'content':raw.get('content_text') or name,'url':link,'time':raw.get('display_time') or 0,'source':'华尔街见闻'})
-            if len(items)>=limit: break
-        return items
+        return news_fetch.fetch_wallstreetcn(self.root,ai_only=ai_only,limit=limit)
 
-    # ---------- 通用抓取工具（第 2 步新增，供所有新闻源共用） ----------
     def news_get(self,url,referer=None):
-        # 带浏览器身份的 GET，返回文本。证书优先用项目自带的，缺文件时退回系统证书
-        ca_file=self.root/'assets/cacert.pem'
-        context=ssl.create_default_context(cafile=str(ca_file)) if ca_file.exists() else ssl.create_default_context()
-        headers={'User-Agent':BROWSER_UA}
-        if referer: headers['Referer']=referer
-        request=urllib.request.Request(url,headers=headers)
-        with urllib.request.urlopen(request,context=context,timeout=25) as response:
-            return response.read(2*1024*1024).decode('utf-8','ignore')
+        return news_fetch.news_get(url,self.root,referer=referer)
 
     def parse_rss(self,text,name,limit):
-        # 解析 RSS 2.0 / Atom 两种格式，返回统一结构
-        import xml.etree.ElementTree as ET
-        root=ET.fromstring(text.encode('utf-8'))
-        atom='{http://www.w3.org/2005/Atom}'
-        entries=root.findall('.//item') or root.findall('.//'+atom+'entry')
-        items=[]
-        for entry in entries:
-            def field(tag):
-                node=entry.find(tag)
-                if node is None: node=entry.find(atom+tag)
-                return (node.text or '').strip() if node is not None else ''
-            title=field('title'); link=field('link')
-            if not link:  # Atom 的链接写在属性里
-                node=entry.find(atom+'link')
-                if node is not None: link=(node.get('href') or '').strip()
-            if not title or not link: continue
-            # 时间：RSS 用 pubDate，Atom 用 published/updated
-            stamp=0
-            raw_time=field('pubDate') or field('published') or field('updated')
-            if raw_time:
-                try: stamp=int(email.utils.parsedate_to_datetime(raw_time).timestamp())
-                except (TypeError,ValueError):
-                    try: stamp=int(datetime.fromisoformat(raw_time.replace('Z','+00:00')).timestamp())
-                    except (TypeError,ValueError): stamp=0
-            # 正文摘要：description 可能带 HTML，去掉标签
-            body=field('description') or field('summary') or ''
-            content=re.sub(r'\s+',' ',re.sub(r'<[^>]+>',' ',html.unescape(body))).strip()
-            items.append({'name':title,'content':content or title,'url':link,'time':stamp,'source':name})
-            if len(items)>=limit: break
-        return items
+        return news_fetch.parse_rss(text,name,limit)
 
     def parse_cn_time(self,raw):
-        # 把网页上中文写法的时间换成时间戳，认不出来的返回 0（当作「没有时间」）
-        # 支持：刚刚 / 36分钟前 / 2小时前 / 今天 16:47 / 昨天 23:10 / 11-12 08:30
-        raw=(raw or '').strip()
-        if not raw: return 0
-        current=now()
-        found=re.search(r'(\d+)\s*分钟前',raw)
-        if found: return int((current-timedelta(minutes=int(found.group(1)))).timestamp())
-        found=re.search(r'(\d+)\s*小时前',raw)
-        if found: return int((current-timedelta(hours=int(found.group(1)))).timestamp())
-        if '刚刚' in raw: return int(current.timestamp())
-        # 只有月日没有年份时，按今年算
-        found=re.search(r'(?:(\d{4})-)?(\d{1,2})-(\d{1,2})\s+(\d{1,2}):(\d{2})',raw)
-        if found:
-            year=int(found.group(1) or current.year)
-            try: return int(datetime(year,int(found.group(2)),int(found.group(3)),int(found.group(4)),int(found.group(5)),tzinfo=TZ).timestamp())
-            except ValueError: return 0
-        found=re.search(r'(今天|昨天)?\s*(\d{1,2}):(\d{2})',raw)
-        if found:
-            base=current-timedelta(days=1) if found.group(1)=='昨天' else current
-            try: return int(base.replace(hour=int(found.group(2)),minute=int(found.group(3)),second=0,microsecond=0).timestamp())
-            except ValueError: return 0
-        return 0
+        return news_fetch.parse_cn_time(raw,now_fn=now)
 
     def parse_html(self,text,name,item_re,base,limit,time_re=None):
-        # 用正则从网页里挖出 (链接, 标题)；只适合列表结构固定的站
-        # time_re 可选：给一个能抓到「时间文字」的正则，就能拿到真实发布时间，抓不到就是 0
-        items=[]; seen=set()
-        matches=list(re.finditer(item_re,text,re.S))
-        for index,match in enumerate(matches):
-            link,raw_title=match.group(1),match.group(2)
-            title=re.sub(r'\s+',' ',re.sub(r'<[^>]+>','',raw_title)).strip()
-            if not title or title in NAV_WORDS or len(title)<4: continue
-            if not link.startswith('http'): link=base+link
-            link=link.replace('http://','https://',1) if link.startswith('http://') else link
-            if link in seen: continue
-            seen.add(link)
-            # 时间：从本条标题到下一个条目之间的那段 HTML 里找时间文字
-            stamp=0
-            if time_re:
-                end=matches[index+1].start() if index+1<len(matches) else len(text)
-                found=re.search(time_re,text[match.end():end],re.S)
-                if found: stamp=self.parse_cn_time(re.sub(r'<[^>]+>',' ',found.group(1)))
-            items.append({'name':title,'content':title,'url':link,'time':stamp,'source':name})
-            if len(items)>=limit: break
-        return items
+        return news_fetch.parse_html(text,name,item_re,base,limit,time_re,now_fn=now)
 
     def parse_github(self,text,name,limit):
-        # GitHub 中文排行榜专用解析：一条榜单要两个信息——仓库名 + 这个仓库是干什么的
-        # 页面结构是「仓库链接 → 星标数 → 一段中文简介(div class 里带 line-clamp-6)」
-        # 所以按链接位置把整页切成一段一段，每段里再找那一段简介，天然不会错位
-        items=[]
-        links=list(re.finditer(r'href="(https://github\.com/[^/"]+/[^/"]+)"',text))
-        for index,match in enumerate(links):
-            # 本段的结尾 = 下一个链接的开始，这样一段里只会有自己那条仓库的简介
-            end=links[index+1].start() if index+1<len(links) else len(text)
-            block=text[match.end():end]
-            link=match.group(1).split('?')[0].rstrip('/')
-            # 仓库全名取链接里的 owner/repo 两段，例如 labuladong/fucking-algorithm
-            parts=link.replace('https://github.com/','').split('/')
-            if len(parts)<2 or not parts[0] or not parts[1]: continue
-            repo=parts[0]+'/'+parts[1]
-            # 简介：站点已经给中文 AI 总结，直接取；抓不到就留空（后面用仓库名占位）
-            desc=''
-            found=re.search(r'line-clamp-6[^"]*">(.*?)</div>',block,re.S)
-            if found:
-                desc=html.unescape(re.sub(r'<[^>]+>',' ',found.group(1)))
-                desc=re.sub(r'\s+',' ',desc).strip()
-            # 站点把最后更新时间写成「更新于 1 年前」或直接「3 个月前」「19 天前」
-            # 这里把相对时间换算成具体日期再显示：今天显示时分，今年内显示 月/日，往年显示年份
-            label=''
-            stamps=re.findall(r'(\d+)\s*(秒|分钟|小时|天|个?月|年)前',block)
-            if stamps:
-                number,unit=stamps[-1]; number=int(number); moment=now()
-                if unit=='秒': moment=moment-timedelta(seconds=number)
-                elif unit=='分钟': moment=moment-timedelta(minutes=number)
-                elif unit=='小时': moment=moment-timedelta(hours=number)
-                elif unit=='天': moment=moment-timedelta(days=number)
-                elif unit in ('月','个月'): moment=moment-timedelta(days=30*number)
-                else: moment=moment-timedelta(days=365*number)
-                # 规则：只要是本年度的，一律显示 月/日；跨年的显示两位年份+年
-                if moment.year==now().year: label=f'{moment.month}/{moment.day}'
-                else: label=f'{moment.year%100}年'
-            # time 给 0：榜单本身没有发布时间，标记成「无时间」，合并排序时会排在新闻后面
-            items.append({'name':repo,'content':desc or repo,'url':link,'time':0,'source':name,'date_label':label})
-            if len(items)>=limit: break
-        return items
+        return news_fetch.parse_github(text,name,limit,now_fn=now)
 
     def fetch_source(self,src):
-        # 按配置表里的一种 kind 去抓，统一返回 5 字段结构
-        kind=src['kind']; name=src['name']; limit=src.get('limit',20)
-        if kind=='wallstreetcn': return self.fetch_wallstreetcn(ai_only=False,limit=limit)
-        if kind=='json_douyin':
-            raw=json.loads(self.news_get(src['url'],referer='https://www.douyin.com/'))
-            stamp=int(time.time()); items=[]
-            for row in (raw.get('data') or {}).get('word_list') or []:
-                title=(row.get('word') or '').strip()
-                if not title: continue
-                items.append({'name':title,'content':title,
-                              'url':'https://www.douyin.com/hot/'+str(row.get('sentence_id') or ''),
-                              'time':int(row.get('event_time') or stamp),'source':name})
-                if len(items)>=limit: break
-            return items
-        if kind=='json_weibo':
-            # 微博热搜榜：data.realtime[]，广告位跳过；榜单没有发布时间（time=0），
-            # 热度值放进 date_label 给首页右列显示，排序走 place_github 的榜单穿插
-            raw=json.loads(self.news_get(src['url'],referer='https://weibo.com/'))
-            items=[]
-            for row in (raw.get('data') or {}).get('realtime') or []:
-                if not isinstance(row,dict) or row.get('is_ad'): continue
-                title=str(row.get('word') or row.get('note') or '').strip()[:150]
-                if not title: continue
-                rank=len(items)+1
-                try: heat=int(row.get('num') or 0)
-                except (TypeError,ValueError): heat=0
-                if heat>=100000000: label=('%.1f'%(heat/1e8)).rstrip('0').rstrip('.')+'亿'
-                elif heat>=10000: label=('%.1f'%(heat/10000)).rstrip('0').rstrip('.')+'万'
-                elif heat>0: label=str(heat)
-                else: label='#'+str(rank)
-                items.append({'name':title,'content':title+'\n热度：'+(str(heat) if heat else '—'),
-                              'url':'https://s.weibo.com/weibo?q='+urllib.parse.quote('#'+title+'#'),
-                              'time':0,'source':name,'date_label':label[:20]})
-                if len(items)>=limit: break
-            return items
-        text=self.news_get(src['url'])
-        if kind=='rss': return self.parse_rss(text,name,limit)
-        if kind=='html': return self.parse_html(text,name,src['item_re'],src.get('base',''),limit,src.get('time_re'))
-        if kind=='github': return self.parse_github(text,name,limit)
-        return []
+        return news_fetch.fetch_source(src,self.root,now_fn=now)
 
     def fetch_news(self,ai_only=True):
-        # 多源合并：把配置表里所有开启的源都抓一遍，合并后去重、按时间倒序
-        # ai_only 参数保留但不再使用（热点资讯要全量，不按主题过滤）
-        config=self.store.read()
-        settings=config.get('settings',{})
-        merged=[]; errors=[]; ok=0
-        for src in NEWS_SOURCES:
-            if not settings.get('news_'+src['key'],True): continue
-            try:
-                items=self.fetch_source(src)
-                if items: ok+=1
-                merged.extend(items)
-                LOG.info('NEWS_SRC %s=%s',src['name'],len(items))
-            except Exception as error:
-                errors.append(src['name']+'：'+type(error).__name__)
-                LOG.info('NEWS_SRC_FAIL %s %s',src['name'],error)
-        # 去重：链接（去掉 ?# 参数和末尾斜杠）或标题（去空白取前 30 字）重复的只留一条
-        seen_url=set(); seen_title=set(); uniq=[]
-        for item in merged:
-            url_key=re.sub(r'[?#].*$','',item.get('url') or '').rstrip('/').lower()
-            title_key=re.sub(r'\s+','',item.get('name') or '')[:30].lower()
-            if not title_key or url_key in seen_url or title_key in seen_title: continue
-            seen_url.add(url_key); seen_title.add(title_key); uniq.append(item)
-        # 排序：有发布时间的按新→旧排前面；GitHub 榜单没有发布时间（time=0），整体排到新闻之后
-        # 两个键：先比「有没有时间」，再比「时间大小」；同一批无时间的保持榜单原顺序（star 排名）
-        uniq.sort(key=lambda row:(1 if int(row.get('time') or 0) else 0,int(row.get('time') or 0)),reverse=True)
-        LOG.info('NEWS_MERGE raw=%s uniq=%s sources_ok=%s',len(merged),len(uniq),ok)
-        if uniq: return uniq
-        if errors: raise ValueError('资讯获取失败（'+'，'.join(errors)+'）')
-        return []
+        return news_fetch.fetch_news(self.store,self.root,ai_only=ai_only,now_fn=now,log=LOG)
 
     def place_github(self,items):
-        # 榜单型源（GitHub / 微博热搜）没有发布时间，靠时间排序只能沉到最后
-        # 所以单独摆放：默认均匀穿插，翻页时每屏都能碰到榜单内容，又不挤占新闻的位置
-        # 两个榜单交替出现（一条微博、一条仓库……），避免开头全是同一个源
-        if GITHUB_PLACE=='bottom': return items
-        board=[item for item in items if item.get('source') in BOARD_SOURCES]
-        news=[item for item in items if item.get('source') not in BOARD_SOURCES]
-        if not board or not news: return items
-        if GITHUB_PLACE=='top': return board+news
-        mixed=[]; queues={name:[] for name in BOARD_SOURCES}
-        for item in board: queues[item.get('source')].append(item)
-        while any(queues.values()):
-            for name in BOARD_SOURCES:
-                if queues[name]: mixed.append(queues[name].pop(0))
-        step=max(1,len(news)//len(mixed))   # 每隔这么多条新闻，插一条榜单内容
-        out=[]; index=0
-        for order,item in enumerate(news):
-            out.append(item)
-            if index<len(mixed) and (order+1)%step==0:
-                out.append(mixed[index]); index+=1
-        out.extend(mixed[index:])
-        return out
+        return news_fetch.place_github(items)
+
 
     def update_news(self):
         config=self.store.read()

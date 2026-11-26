@@ -7,7 +7,8 @@ from datetime import datetime
 import ast, hashlib, os, shutil, sys, json
 
 ROOT=Path(__file__).resolve().parent
-PROGRAM=['app.py','pages.py','renderer.py','store.py','native_input.py','device_control.py','modules.py','phone.py','updater.py','start.sh']
+PROGRAM=['app.py','pages.py','renderer.py','store.py','native_input.py','device_control.py','modules.py','phone.py','updater.py','news_sources.py','news_content.py','news_fetch.py','news_display.py','start.sh']
+
 LIBRARY_ENTRY='IndependentDashboard.sh'
 
 def find_kindle():

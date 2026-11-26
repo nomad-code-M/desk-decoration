@@ -7,8 +7,7 @@ SOURCE=ROOT/'kindle-standalone'
 sys.path.insert(0,str(SOURCE))
 from store import initialize_data
 
-FILES=('app.py','renderer.py','native_input.py','pages.py','store.py','updater.py','device_control.py','modules.py','phone.py',
-       'start.sh','IndependentDashboard.sh')
+FILES=('app.py','renderer.py','native_input.py','pages.py','store.py','updater.py','device_control.py','modules.py','phone.py','news_sources.py','news_content.py','news_fetch.py','news_display.py','start.sh','IndependentDashboard.sh')
 IGNORE=shutil.ignore_patterns('__pycache__','*.pyc','*.pyo')
 
 def check_source():

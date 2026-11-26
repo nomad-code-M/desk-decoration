@@ -8,17 +8,10 @@ from store import NEWS_LABELS
 ROOT=Path(__file__).resolve().parent
 FONT_ASSETS=Path(os.environ.get('KINDLE_PREFLIGHT_ASSETS',str(ROOT/'assets')))
 TZ=timezone(timedelta(hours=8))
-NEWS_LIMIT=300
-NEWS_MAX_AGE=48*3600
-# 各个源的开关名与显示名来自 store.py 的 NEWS_SOURCES（唯一配置源），这里不再重复维护
-# 开关名集合，app.py 判断「改了来源设置要不要立刻重抓」时用
-NEWS_KEYS=tuple(key for key,_ in NEWS_LABELS)
-# 来源开关页每行的点击区域：行高按源的数量自适应，以后加到 7、8 个源也不会挤出屏幕
-_SOURCE_TOP=112
-_SOURCE_ROW=min(86,(700-_SOURCE_TOP)//max(1,len(NEWS_LABELS)))
-SOURCE_ROWS=[(30,_SOURCE_TOP+i*_SOURCE_ROW,570,_SOURCE_TOP+(i+1)*_SOURCE_ROW-8) for i in range(len(NEWS_LABELS))]
-# 首页轮播秒数在设备上点一下的备选刻度（手机后台可填 5-300 任意整数）
-CAROUSEL_STEPS=(15,30,45,60,90,120)
+from news_content import news_items, enabled_news, NEWS_LIMIT, NEWS_MAX_AGE # 引用入口
+from news_display import (fmt_news_time, fmt_news_full, news_brief, render_news_detail,
+                          render_news_history, render_source_picker, NEWS_KEYS, SOURCE_ROWS,
+                          CAROUSEL_STEPS, HOME_NEWS_PER_PAGE)
 def now(): return datetime.now(TZ)
 
 # BEGIN OFFLINE CALENDAR TABLES
@@ -547,44 +540,10 @@ def parsed_time(value):
         return value.replace(tzinfo=TZ) if value.tzinfo is None else value
     except (TypeError,ValueError): return None
 
-def news_items(value):
-    if not isinstance(value,list): return []
-    return [item for item in value if isinstance(item,dict) and isinstance(item.get('name'),str) and item['name'].strip()][:NEWS_LIMIT]
-
-def enabled_news(config,items):
-    settings=config.get('settings') or {}
-    # 每个源一个开关；source 不在表里的（比如以后新加的源还没登记）默认显示，不会被误藏
-    sources={label:settings.get(key,True) for key,label in NEWS_LABELS}
-    return [item for item in items if sources.get(item.get('source'),True)]
-
-def merge_news_history(previous,incoming=(),current=None,fallback=None):
-    """Bound history by publication age; unknown dates expire from first seen."""
-    stamp=(current or now()).timestamp()
-    def timestamp(value):
-        try:
-            number=float(value)
-            return number if math.isfinite(number) and 0<number<=stamp+300 else None
-        except (TypeError,ValueError,OverflowError): return None
-    fallback=timestamp(fallback) or stamp
-    unique={}
-    for raw in news_items(previous)+news_items(list(incoming)):
-        name=raw['name'][:2000]
-        url=str(raw.get('url') or '')[:2048]
-        source=str(raw.get('source') or '')[:60]
-        key=url or (source,name)
-        old=unique.get(key,{})
-        seen=timestamp(old.get('seen_at')) or timestamp(raw.get('seen_at')) or fallback
-        published=timestamp(raw.get('time'))
-        retained=published or seen
-        if retained<stamp-NEWS_MAX_AGE: continue
-        item=dict(name=name,url=url,source=source,time=int(published or 0),seen_at=seen)
-        content=str(raw.get('content') or old.get('content') or '')
-        if content: item['content']=content[:12000]+('…（更多内容请用手机查看原文）' if len(content)>12000 else '')
-        # GitHub 榜单那类没有发布时间的内容，用换算好的具体日期（11/12、23年）当时间显示
-        label=str(raw.get('date_label') or old.get('date_label') or '')
-        if label: item['date_label']=label[:20]
-        unique[key]=item
-    return sorted(unique.values(),key=lambda v:v['time'] or v['seen_at'],reverse=True)[:NEWS_LIMIT]
+def merge_news_history(previous,incoming=(),current=None,fallback=None):   
+    # 转发到 news_content，并注入本模块的 now（保留 renderer.now 的测试打桩链）
+    import news_content
+    return news_content.merge_news_history(previous,incoming,current,fallback,now_fn=now)
 
 def clock_text(moment,time_format='24'):
     if time_format=='12':
@@ -597,20 +556,9 @@ def event_time(value,time_format='24'):
     try: return clock_text(datetime.strptime(str(value),'%H:%M'),time_format)
     except (TypeError,ValueError): return str(value)
 
-def fmt_news_time(value,current,time_format='24'):
-    try: stamp=int(value)
-    except (TypeError,ValueError): return ''
-    if stamp<=0: return ''   # 0 表示「没有发布时间」（比如 GitHub 榜单），不显示假时间
-    moment=datetime.fromtimestamp(stamp,TZ)
-    if moment.date()==current.date(): return clock_text(moment,time_format)
-    return moment.strftime('%m/%d')
 
-def fmt_news_full(value,time_format='24'):
-    try: stamp=int(value)
-    except (TypeError,ValueError): return ''
-    if stamp<=0: return ''
-    moment=datetime.fromtimestamp(stamp,TZ)
-    return moment.strftime('%m-%d')+' '+clock_text(moment,time_format)
+
+
 
 _MEASURE=ImageDraw.Draw(Image.new('L',(8,8)))
 
@@ -725,26 +673,7 @@ def _draw_buttons(d,labels):
             d.rectangle((x,728,x+172,777),outline=0,width=2)
             d.text((x+86,742),label,font=font(18,True),fill=0,anchor='mt')
 
-def render_news_detail(item,page,pages,current=None,time_format='24'):
-    current=current or now()
-    image=Image.new('L',(600,800),255)
-    d=ImageDraw.Draw(image)
-    weibo=item.get('source')=='微博热搜'
-    d.text((30,25),'微博热搜' if weibo else 'AI 金融资讯',font=font(20,True),fill=0,anchor='lt')
-    when=fmt_news_full(item.get('time'),time_format)
-    meta=('加载中' if item.get('detail_loading') else '相关新闻摘要') if weibo else (item.get('source') or '')+((' · '+when) if when else '')
-    d.text((502 if weibo else 570,28),fit_text(d,meta,14,300 if weibo else 360),font=font(14),fill=80,anchor='rt')
-    if weibo: action_icon(d,'refresh',551,36,26,160 if item.get('detail_loading') else 0)
-    d.line((30,58,570,58),fill=0,width=2)
-    total=max(1,len(pages))
-    page=max(0,min(page,total-1))
-    yy=84
-    for line in pages[page]:
-        d.text((30,yy),line,font=font(24),fill=0,anchor='lt'); yy+=38
-    if total>1:
-        d.text((570,700),f'第 {page+1} / {total} 页',font=font(14),fill=110,anchor='rt')
-    _draw_buttons(d,('返回','上一页' if page>0 else '','下一页' if page<total-1 else ''))
-    return image
+
 
 def render_event_detail(event,confirm,current=None,message='',time_format='24'):
     current=current or now()
@@ -916,35 +845,9 @@ def render_agenda(config,page=0,day=None,time_format='24'):
     _draw_buttons(d,('返回','新增','日历'))
     return image
 
-def news_brief(item):
-    # 列表里那句「这条到底是干什么的」的说明：和标题重复就不显示，省一行给别的条目
-    content=' '.join(str(item.get('content') or '').split())
-    title=' '.join(str(item.get('name') or '').split())
-    if not content or content==title: return ''
-    if title and content.startswith(title[:10]): return ''
-    return content
 
-def render_news_history(items,page=0,refreshing=False,time_format='24',title='AI 金融资讯',history=True):
-    selected,page,total=page_slice(items,page)
-    subtitle='正在更新资讯…' if refreshing else ('最近 48 小时' if history else '当前榜单')+f' · 共 {len(items)} 条 · 点条目查看'
-    image,d=section_frame(title+(' · 历史' if history else ' · 全部'),subtitle)
-    if not selected: d.text((30,155),'最近 48 小时暂无已缓存资讯。',font=font(22),fill=0,anchor='lt')
-    for i,item in enumerate(selected):
-        y=125+i*85
-        meta=fmt_news_full(item.get('time'),time_format) or '获取于 '+fmt_news_full(item.get('seen_at'),time_format)
-        d.text((30,y),fit_text(d,(meta+' · ' if meta else '')+item.get('source',''),16,540),font=font(16),fill=75,anchor='lt')
-        title_lines=wrap_lines(' '.join(item['name'].split()),20,540)
-        brief=news_brief(item)
-        if brief:
-            # 有简介时标题只占一行，第二行放简介，这样一眼就能看出这条讲什么
-            title_lines=title_lines[:1]
-            d.text((30,y+48),fit_text(d,brief,16,540),font=font(16),fill=90,anchor='lt')
-        for j,line in enumerate(title_lines[:2]):
-            d.text((30,y+25+j*24),line,font=font(20),fill=0,anchor='lt')
-        d.line((30,y+80,570,y+80),fill=205,width=1)
-    pager(d,page,total)
-    _draw_buttons(d,('返回','',''))
-    return image
+
+
 
 POMO_MINUS=(110,581,230,640)
 POMO_PLUS=(370,581,490,640)
@@ -1294,23 +1197,7 @@ def render_module_picker(config):
     icon_button(d,(214,728,386,777),'phone')
     return image
 
-def render_source_picker(config):
-    # 6 个新闻源逐个开关：关掉的源既不抓取也不上首页，剩下的自动重新排
-    settings=config.get('settings') or {}
-    image,d=section_frame('资讯来源','轻触开启或关闭 · 全部关闭则只看缓存')
-    for index,(key,label) in enumerate(NEWS_LABELS):
-        box=SOURCE_ROWS[index]; x0,y0,x1,y1=box; middle=(y0+y1)//2
-        on=bool(settings.get(key,True))
-        d.rounded_rectangle(box,radius=6,outline=0 if on else 140,width=2 if on else 1)
-        d.text((48,middle),label,font=font(21,True),fill=0 if on else 110,anchor='lm')
-        d.text((500,middle),'开启' if on else '关闭',font=font(17),fill=70 if on else 120,anchor='rm')
-        checkbox(d,520,middle-14,28,on)
-    # 提示文字自动落在最后一行下面，行数多的时候不挤
-    tip_y=_SOURCE_TOP+len(NEWS_LABELS)*_SOURCE_ROW+6
-    if tip_y<716: d.text((300,tip_y),'改动会在下一次抓取时生效',font=font(15),fill=90,anchor='mt')
-    icon_button(d,(30,728,202,777),'back')
-    icon_button(d,(214,728,386,777),'phone')
-    return image
+
 
 def render_sleep_photo(path,system=False):
     from PIL import ImageOps
@@ -1322,8 +1209,7 @@ def render_sleep_photo(path,system=False):
     except OSError: pass
     return image
 
-# 首页资讯区一屏显示几条（同时也是轮播的翻页步长）
-HOME_NEWS_PER_PAGE=6
+
 
 def render(config, state, current=None, news_page=0):
     current=current or now()

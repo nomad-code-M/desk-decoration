@@ -2,7 +2,7 @@
 import ast,errno,hashlib,io,json,os,re,shutil,signal,subprocess,sys,time,uuid,zipfile
 from pathlib import Path
 ROOT=Path(__file__).resolve().parent
-CORE=('app.py','renderer.py','pages.py','store.py','native_input.py','device_control.py','modules.py','phone.py')
+CORE=('app.py','renderer.py','pages.py','store.py','native_input.py','device_control.py','modules.py','phone.py','news_sources.py','news_content.py','news_fetch.py','news_display.py')
 MAX_PACKAGE=4*1024*1024
 MAX_EXPANDED=8*1024*1024
 
